@@ -1,0 +1,475 @@
+# Connector Execution
+
+Read this file only after selecting a connector-backed candidate.
+
+This page inherits the constitution from `SKILL.md`: connector schema is the
+only source of service names, action names, input fields, output fields, and
+artifact semantics.
+
+## Goal
+
+Turn a connector candidate into a callable connector contract, then send the
+smallest sufficient JSON payload that matches the user's real intent.
+
+## Confirm the action contract
+
+- Use the chosen search result's `service` and `name` as the starting point.
+- Run `oo connector schema "<service>.<action>"` before building any payload.
+- To inspect several actions, pass multiple `<service>.<action>` ids to one
+  command instead of running one command per action. With two or more ids the
+  output is a JSON array in request order; with one id it stays a single JSON
+  object.
+- Use the returned exact `service`, `name`, `description`, `inputSchema`, and
+  `outputSchema` to confirm the action fit.
+- Prefer the action whose description most directly matches the user's desired
+  outcome, especially when the user named the target service.
+- If the selected schema directly satisfies the outcome and required inputs are
+  available, build the payload and execute; do not rediscover adjacent actions.
+- If schema evidence does not prove the action can satisfy the user outcome,
+  refine discovery or stop with a catalog miss.
+
+Representative schema command:
+
+```bash
+oo connector schema "gmail.send_mail"
+```
+
+Batch form for several actions at once (returns a JSON array in request
+order), useful when a workflow needs more than one contract, such as an async
+submit/result pair or a read step feeding a write step:
+
+```bash
+oo connector schema "cal.create_schedule" "callingly.get_agent_schedule"
+```
+
+Representative schema JSON shape:
+
+```json
+{
+  "description": "Send a Gmail message.",
+  "inputSchema": {},
+  "name": "send_mail",
+  "outputSchema": {},
+  "service": "gmail"
+}
+```
+
+## Build connector payload
+
+- Use the returned `inputSchema` and normal JSON Schema required-field
+  semantics.
+- Use only declared input fields.
+- Prefer concrete user values over placeholders, broad guesses, or defaults.
+- Preserve service-specific constraints such as recipient, folder, file id,
+  time range, calendar, channel, label, format, or destination.
+- If an input can accept a URI and the user only has a local file, read
+  [file-transfer.md](file-transfer.md) before executing. In
+  `oo connector run`, pass the file as `{ "$file": "<path>" }` instead of a
+  separate upload step.
+- If the task depends on raw file bytes, local paths, or unsupported
+  special-media handles that cannot be submitted safely through normal JSON,
+  stop the current `oo` path.
+
+## External side effects
+
+Actions that send, post, invite, update, delete, move, share, or otherwise
+change third-party state need high confidence before execution.
+
+Proceed directly only when the user's intent and all required payload values are
+unambiguous. Otherwise ask one focused question or confirmation. Do not use
+`--dry-run` as a substitute for completing an explicitly requested action, but
+honor user requests to validate without executing.
+
+An explicit user instruction plus complete required payload values is sufficient
+confidence for non-destructive send, post, create, or invite actions. For
+destructive actions or broad sharing, follow the host's confirmation rules. Ask
+when authorization, recipient, content, or destination choices remain unclear.
+An `approval_required` response overrides this; follow
+[advisory confirmation](#advisory-confirmation).
+
+## Execute the connector path
+
+Canonical form:
+
+```bash
+oo connector run "<serviceName>" \
+  --action "<actionName>" \
+  --data '<json object>' \
+  --json
+```
+
+Facts:
+
+- `serviceName` is the only positional argument.
+- `--action` is required and selects the connector action name.
+- `--data` must be a JSON object string, `@path/to/file.json`, or `@-` to
+  read the JSON from stdin. Prefer `@-` (for example with a heredoc) for large
+  payloads or values that are awkward to shell-quote, instead of writing a
+  temporary file.
+- If `--data` is omitted, the CLI uses `{}`.
+- If a service has multiple connected apps or execution fails with
+  `connection_ambiguous`, run `oo connector apps "<serviceName>" --json`, pick
+  the intended `connectionName`, then pass `--connection-name "<connectionName>"`
+  to `oo connector run`.
+- If search supplies an `appId`, pass `--app-id "<appId>"` to select that exact
+  connection. It conflicts with `--connection-name`.
+- For a selected cross-team result, execute with
+  `OO_TEAM_ID="<teamId>" oo connector run "<service>" --action "<action>" --app-id "<appId>" --data '<json object>' --json`.
+  Use IDs from the same result, preserve that team/app pair for async polling,
+  and do not add `--team` (which would override the selected team ID).
+  This per-command environment override does not change the saved current team.
+  Schema lookup is team-independent; still inspect the contract before running.
+- `--json` returns a stable JSON object for execution output.
+- In execution responses, the execution id is nested under
+  `meta.executionId`, not a top-level field.
+- With `--json`, a failure leaves stdout empty and writes one JSON line to
+  stderr: `{ "error": { code, message, exitCode, details? } }`. Read
+  `error.code` and `error.details` instead of parsing `error.message`.
+  Request failures use `connectorRun.requestFailed` /
+  `connectorProxy.requestFailed` with `details.httpStatus` and, when the
+  server sent one, `details.upstreamErrorCode`. Payload validation failures
+  use `connectorRun.invalidPayload` with `details.issues[]` entries
+  `{ path, keyword, message, params }`; fix the fields at each `path` and
+  retry once. With `--wait-result`, every polling failure after
+  the submit response returned a handle includes `details.handle` and
+  `details.submitExecutionId`; reuse that handle instead of submitting again.
+  `connectorRun.asyncHandleMissing` means the task was submitted without a
+  pollable handle: report `details.submitExecutionId` and do not resubmit.
+- The schema returned by `oo connector schema` is the public contract used to
+  build payloads and inspect the action result shape.
+
+## Advisory confirmation
+
+`errorCode: approval_required` means the server's effective policy requires
+advisory confirmation for this action. The blocked action was not executed.
+This requirement depends on the effective user, team and connection policy;
+it is not part of the static action schema. Do not reconnect, refresh the schema,
+or switch teams or connections to avoid it.
+
+The policy owner configured this action to ask the user before it runs, so
+confirming it is the user's decision, not yours. This overrides the
+[external side effects](#external-side-effects) rule.
+
+Pass `--approval` only when one of these holds:
+
+- The user saw the concrete operation and confirmed it in reply. Name the
+  service and action and show the key parameters, such as recipients, content,
+  destination, amounts and the affected resources.
+- The user has said in this conversation that this specific action, or a scope
+  they named explicitly, needs no confirmation.
+
+Nothing else counts, including the user's original request to perform the
+action, even with complete payload values, or a general instruction to proceed
+without asking.
+
+On `approval_required`, if one of the conditions above already holds and the
+retry keeps the key parameters unchanged, retry with `--approval`. Otherwise,
+stop and ask the user to confirm the concrete operation. Ask again when a retry
+would change any key parameter. If no condition holds and you cannot ask the
+user, for example in an unattended or scheduled run, do not retry: report the
+blocked service, action and key parameters, how to resume, and end the task as
+blocked.
+
+The same conditions apply to including `--approval` on the initial call. Keep
+the original team, connection and operation parameters on retries. Never add
+the flag mechanically or put it in default command templates. It is a CLI
+option, not a field in the provider input. The CLI does not prompt or retry
+automatically. `--dry-run` only validates input and does not establish
+confirmation.
+
+For async execution:
+
+- With `--wait`, an explicit `--approval` applies to every poll of the selected
+  result action.
+- With `--wait-result`, the flag applies to the submit action only. Its derived
+  result action does not inherit the declaration.
+- If submission succeeded but a result query requires confirmation, stderr
+  includes recovery JSON with `service`, result `action`, result-query `input`
+  and `submitExecutionId`. The task already exists. Do not submit it again.
+  Ask the user to confirm the result query, then resume using the recovery
+  service, action and input with `--wait` and `--approval`.
+  Retain the original team selection (including environment variables) and
+  `--app-id` or `--connection-name`. `submitExecutionId` identifies the original
+  submission; it is not an input parameter or a CLI option.
+
+## Proxy a provider API request
+
+Use `oo connector proxy` only when the selected connector service supports
+proxy execution and no purpose-built connector action is available for the
+user's requested provider endpoint. Do not use proxy as a first choice when a
+matching connector action exists.
+
+Canonical forms:
+
+```bash
+oo connector proxy "<serviceName>" \
+  --endpoint "<provider-endpoint-path>" \
+  --method GET \
+  --query '<json object>' \
+  --json
+```
+
+```bash
+oo connector proxy "<serviceName>" \
+  --data '{"endpoint":"/path","method":"POST","body":{}}' \
+  --json
+```
+
+Facts:
+
+- `serviceName` is the only positional argument.
+- `--data` accepts the full proxy request object:
+  `{ "endpoint": string, "method": "GET" | "POST" | "PUT" | "PATCH" | "DELETE", "query"?: object, "headers"?: object, "body"?: unknown }`.
+- Without `--data`, build the same object with `--endpoint`, `--method`, and
+  optional `--query`, `--headers`, and `--body`.
+- `--query`, `--headers`, and `--body` are parsed as JSON. To send text in
+  `body`, pass a JSON string such as `"hello"`.
+- Do not pass provider credentials, `Authorization`, cookies, or API keys in
+  proxy headers. The connector service injects authentication from the
+  connected app.
+- Check both `data.status` and the provider response in `data.data`. Upstream
+  HTTP `4xx`/`5xx` exits `1` while preserving the response and execution ID.
+  HTTP `2xx` can also
+  contain provider-specific business errors; exit `0` alone is not proof of
+  success.
+- JSON output has this stable shape:
+
+```json
+{
+  "data": {
+    "status": 200,
+    "headers": {},
+    "data": {}
+  },
+  "meta": {
+    "executionId": "execution-id",
+    "service": "serviceName",
+    "appId": "optional-app-id"
+  }
+}
+```
+
+## Choose the run identity
+
+A connector action or proxy request runs under one identity. Pick it from what
+the user said:
+
+- If the user does not mention any team, add nothing extra. The run then uses
+  the team selected by the `OO_TEAM_ID` / `OO_TEAM_NAME` environment variables
+  when set, then the default team saved on their account when one is set, and
+  the server-side default team otherwise. Check `oo team current` when you need
+  to know which one applies.
+- If the user asks to run as a specific team (for example "run this as Acme" or
+  "use my Acme team"), add `--team "<name>"`, using the team name the user gave:
+
+```bash
+oo connector run "<serviceName>" \
+  --action "<actionName>" \
+  --data '<json object>' \
+  --team "<teamName>" \
+  --json
+```
+
+For proxy requests, use the same identity option:
+
+```bash
+oo connector proxy "<serviceName>" \
+  --endpoint "<provider-endpoint-path>" \
+  --method GET \
+  --team "<teamName>" \
+  --json
+```
+
+- There is no personal run against the OOMOL connector: every run is
+  attributed to a team. With no flag, the team comes from `OO_TEAM_ID` /
+  `OO_TEAM_NAME`, then the saved account default, and otherwise the server
+  applies the account's default team. `--team` overrides all of those for one
+  run. A self-hosted connector has no team concept: it rejects `--team` and
+  ignores the env variables and the saved default.
+
+Facts:
+
+- Do not guess a team name. If the user is vague about which team to use, ask
+  before running.
+- The action schema itself is identity-independent, so `oo connector schema`
+  never needs a team argument.
+
+Expected execution JSON:
+
+```json
+{
+  "data": {},
+  "meta": {
+    "executionId": "execution-id"
+  }
+}
+```
+
+## Read current response shapes defensively
+
+Connector providers can expose the same operational value under different
+field names. Until the selected schema or CLI output proves a single canonical
+field, read common response fields defensively and keep the raw response file
+for debugging.
+
+Common accessors:
+
+```bash
+jq -r '.task.id // .data.sessionId // .data.sessionID // .data.taskId // .data.taskID // .sessionId // .sessionID // .taskId // .taskID // empty' run.json
+jq -r '.state // .data.state // .task.state // empty' state.json
+jq '.result // .data.result // .data.data // .data // .' result.json
+```
+
+Rules:
+
+- Prefer `task.id` when present, but support provider-specific task id fields
+  such as `sessionId`, `sessionID`, `taskId`, and `taskID`.
+- Prefer the selected schema's documented result field over generic fallback
+  accessors.
+- Do not discard a successful partial response just because an optional
+  convenience field is absent.
+
+## Long-running connector actions
+
+Some connectors expose submit, state, and result actions instead of a single
+synchronous action. Treat that pattern as a resumable task lifecycle.
+
+Rules:
+
+- Fetch the whole lifecycle contract up front with one batch schema call, for
+  example
+  `oo connector schema "<service>.<submit_action>" "<service>.<result_action>"`,
+  instead of one schema command per lifecycle action.
+- Submit exactly once for the same logical work item.
+- Immediately save the submit response and extracted task id in a checkpoint
+  file before polling.
+- Poll the state action with the saved task id; do not resubmit after a timeout
+  or interrupted wait.
+- Treat states such as `queued`, `pending`, `processing`, and `running` as
+  non-terminal.
+- Treat `completed`, `complete`, `succeeded`, or `success` as terminal success,
+  then call the result action.
+- Treat `failed`, `error`, and `canceled` as terminal failure and
+  report the provider error without creating a replacement task unless the
+  user asks to retry with changed inputs.
+- If state is still processing and provider progress is `0`, treat progress as
+  unavailable, not as failure.
+- On timeout, report the saved task id and the exact checkpoint file or resume
+  command needed to continue polling.
+
+## Interpret outputs by schema semantics
+
+- Interpret connector output fields by their documented meaning, not by URL
+  shape alone.
+- If an output field is documented as a download URL, read
+  [file-transfer.md](file-transfer.md) before saving it locally.
+- Treat browse metadata such as `webViewLink`, edit URLs, folder URLs, or
+  console URLs as non-downloadable unless the schema or action description says
+  they return file content.
+- If only metadata came back, report metadata as metadata. Do not synthesize a
+  download URL.
+
+## Storage-style connectors
+
+Storage connectors such as Google Drive, Dropbox, and OneDrive often separate
+locating a file from materializing its bytes.
+
+State model:
+
+1. Locate
+   Use a `find_*`, `list_*`, or similarly described action when the user needs
+   to identify a file or folder. Treat the result as metadata.
+2. Select
+   If the locate action returns multiple candidates and the user's target is
+   ambiguous, ask one focused question. If the locator clearly identifies one
+   item, use its stable id or documented locator field.
+3. Materialize
+   Discover or choose an action whose description identifies it as download or
+   export and whose `outputSchema` exposes a download URL field, such as
+   `transitUrl` on `googledrive.download_file`.
+   Prefer refining within the same connector service first, naming the selected
+   service in the query sentence as a constraint.
+4. Save
+   Feed that documented download URL to `oo file download`. Do not feed
+   `webViewLink`, edit URLs, folder URLs, or console URLs to file download.
+
+If the same connector offers several find-style actions, prefer the one whose
+filters match the user's locator by name, id, folder, type, or time range so
+the result is as narrow as possible.
+
+## Authorization blockers
+
+Inspect `errorCode` (`error.details.upstreamErrorCode` in JSON error output)
+before broader troubleshooting. These error codes block operations on the
+selected connection until it is connected or reauthorized:
+
+- `connection_required`
+- `app_not_found`
+- `app_not_ready`
+- `credential_expired`
+
+On a self-hosted connector these error codes are also terminal:
+
+- `executor_unavailable`: the action is not executable on this self-hosted
+  runtime. Report that and stop; do not retry and do not fall back to local
+  code.
+- `oauth_token_expired`
+- `credential_verification_failed`
+- `unknown_service`
+
+Stop affected operations without probing adjacent actions or retrying. A
+`scope_missing` error, or an explicit provider missing-permission error in a
+proxy response, blocks the operation requiring that scope and its dependent
+steps. It does not establish that the whole connection is unusable. Continue
+independent, already-authorized work only when existing schemas and successful
+execution evidence show it does not require that permission. If the failed
+check is required to satisfy the user's task or authorize a later action, keep
+those dependent steps blocked.
+
+For example, failure to read file sharing settings does not undo a successful
+upload. Preserve uploaded file IDs; do not upload them again. Continue other
+uploads only if reading those settings was optional, and report any unverified
+download or sharing permissions. Do not claim a file is publicly downloadable
+without evidence.
+
+Report:
+
+- completed work and the operation or dependent steps still blocked
+- the connection or re-authorization URL
+- one concise next step
+
+Do not enumerate capabilities or browse third-party docs to work around an
+authorization failure. Read-only investigation is appropriate when the user
+explicitly asks to diagnose or repair authorization.
+
+Use this URL:
+
+```text
+https://console.oomol.com/team/${teamName}/connections/${serviceName}
+```
+
+Replace `${teamName}` with the team already selected for the connector
+operation and `${serviceName}` with the selected connector service. Never
+guess a team name or substitute a team id. Percent-encode both values as
+individual URL path segments using `encodeURIComponent` semantics before
+substitution. If no team name is available, use
+`https://console.oomol.com/connections` instead.
+
+That URL applies to the OOMOL-hosted connector. When the user is on a
+self-hosted connector (see the self-hosted connector mode in
+[auth-and-billing.md](auth-and-billing.md)), point connection fixes at the
+self-hosted console instead: use the `connector.url` value from
+`oo auth status --json` as the console address, not an OOMOL Console URL.
+
+For `connection_required`, `app_not_found`, or `app_not_ready`, explain that
+the connector has not been connected or authorized yet. For
+`credential_expired`, explain that the connector authorization has expired. For
+`scope_missing`, explain that the connector authorization is missing the
+required permission scope.
+
+## Known connector caveats
+
+- Unknown input handles, missing required values, wrong types, or non-object
+  `--data` payloads are rejected.
+- If an input schema contains `contentMediaType` and the value is not
+  `oomol/secret`, current local validation rejects it.
